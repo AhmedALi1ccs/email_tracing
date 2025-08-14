@@ -11,7 +11,15 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 
 def get_conn():
-    return psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+    # Render Postgres typically needs SSL
+    return psycopg2.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+        sslmode=os.getenv("DB_SSLMODE", "require")  # <-- important
+    )
 
 app = Flask(__name__)
 
@@ -20,7 +28,7 @@ def _client_ip():
         request.headers.get("CF-Connecting-IP")
         or (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
         or request.remote_addr
-        or ""
+        or None  # <-- return None, not "", to avoid inet casting errors
     )
 
 def _looks_proxy(ua: str, ip: str, via: str) -> bool:
@@ -28,7 +36,7 @@ def _looks_proxy(ua: str, ip: str, via: str) -> bool:
     v = (via or "").lower()
     if "googleimageproxy" in u or "gmailimageproxy" in u:
         return True
-    if "appleimageproxy" in u or ip.startswith("17."):
+    if "appleimageproxy" in u or (isinstance(ip, str) and ip.startswith("17.")):
         return True
     if "proxy" in v:
         return True
@@ -40,7 +48,8 @@ def open_gif():
     email = request.args.get("email")
     ua = request.headers.get("User-Agent", "")
     via = request.headers.get("Via", "")
-    ip = _client_ip()
+    ip = _client_ip()  # may be None
+
     if campaign and email:
         try:
             suspect = _looks_proxy(ua, ip, via)
@@ -54,8 +63,10 @@ def open_gif():
                 conn.commit()
             finally:
                 conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # TEMP: log to Render logs so you immediately see schema/SSL issues
+            print("open.gif insert error:", repr(e))
+
     resp = make_response(PIXEL_GIF)
     resp.headers["Content-Type"] = "image/gif"
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -64,7 +75,6 @@ def open_gif():
 
 @app.route("/c")
 def click_redirect():
-    # /c?campaign=123&email=a%40b.com&u=<urlencoded target>
     campaign = request.args.get("campaign")
     email = (request.args.get("email") or "").strip().lower()
     url = request.args.get("u") or "/"
@@ -80,9 +90,24 @@ def click_redirect():
                 conn.commit()
             finally:
                 conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print("click insert error:", repr(e))
     return redirect(unquote(url), code=302)
+
+@app.route("/health")
+def health():
+    # quick sanity check endpoint
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM email_opens")
+            opens = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM email_clicks")
+            clicks = cur.fetchone()[0]
+        conn.close()
+        return f"ok opens={opens} clicks={clicks}", 200
+    except Exception as e:
+        return f"db error: {e}", 500
 
 @app.route("/")
 def ok():
